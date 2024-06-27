@@ -77,12 +77,16 @@ class D2NNmodel(nn.Module):
     def __init__(self, pixel_pitch, distance, n_padd, device, lambd_list, size, margin, input_fov, binning_factor):
         super(D2NNmodel, self).__init__()
         self.bin = binning_factor
+        self.input_fov = input_fov
         self.fov_pad = (size - input_fov*binning_factor) // 2
         self.total_pad = self.fov_pad + n_padd
         self.propagation = AngularPropagation(distance, n_padd, pixel_pitch, lambd_list, size)
         self.modulation_1 = ModulationLayer(device, n_padd, size, lambd_list)
         self.modulation_2 = ModulationLayer(device, n_padd, size, lambd_list)
         self.modulation_3 = ModulationLayer(device, n_padd, size, lambd_list)
+        self.modulation_4 = ModulationLayer(device, n_padd, size, lambd_list)
+        self.modulation_5 = ModulationLayer(device, n_padd, size, lambd_list)
+        self.modulation_6 = ModulationLayer(device, n_padd, size, lambd_list)
         self.pool = PoolLayer(margin, self.total_pad, self.bin)
 
     def featurizer(self, x, i):
@@ -94,6 +98,12 @@ class D2NNmodel(nn.Module):
         x = self.modulation_2(x, i)
         x = self.propagation(x, i)
         x = self.modulation_3(x, i)
+        x = self.propagation(x, i)
+        x = self.modulation_4(x, i)
+        x = self.propagation(x, i)
+        x = self.modulation_5(x, i)
+        x = self.propagation(x, i)
+        x = self.modulation_6(x, i)
         x = self.propagation(x, i)
         x = self.pool(x)
         return x

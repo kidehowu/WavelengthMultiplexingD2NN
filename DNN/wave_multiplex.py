@@ -4,10 +4,6 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-from copy import deepcopy
-from torch.optim.lr_scheduler import LambdaLR
-import torch.nn.functional as F
 import sys
 
 
@@ -33,9 +29,8 @@ def make_lr_fn(start_lr, end_lr, num_iter, step_mode='exp'):
     return lr_fn
 
 
-
 class Manager(object):
-    def __init__(self, model, loss_fn, optimizer):
+    def __init__(self, model, loss_fn, optimizer, n_multiplexing):
         # Here we define the attributes of our class
 
         # We start by storing the arguments as attributes
@@ -62,6 +57,8 @@ class Manager(object):
 
         self.visualization = {}
         self.handles = {}
+        self.alph = torch.ones(n_multiplexing, device=self.device, requires_grad=False)
+        self.n_multiplexing = n_multiplexing
 
         # Creates the train_step function for our model,
         # loss function and optimizer
@@ -93,20 +90,21 @@ class Manager(object):
     def _make_train_step_fn(self):
         def perform_train_step_fn(iters_list):
             self.model.train()
-            first_iter = True
+            # first_iter = True
+            losses = []
             for i, it in enumerate(iters_list):
                 x, y = next(it)
                 x = x.to(self.device)
                 y = y.to(self.device)
                 yhat = self.model(x, i)
-                if first_iter:
-                    loss = self.loss_fn(yhat, y)  # First loss initializes 'loss'
-                    first_iter = False
-                else:
-                    loss = loss + self.loss_fn(yhat, y)
+                losses.append(self.loss_fn(yhat, y))
+            loss = torch.stack(losses)
+            ref_loss = loss.detach()
+            loss = (loss * self.alph).mean()
             loss.backward()
             self.optimizer.step()
             self.optimizer.zero_grad()
+            self.alph = torch.clamp(0.1 * (ref_loss - ref_loss.mean()) + self.alph, min=0)
             return loss.item()
 
         return perform_train_step_fn
@@ -114,17 +112,16 @@ class Manager(object):
     def _make_val_step_fn(self):
         def perform_val_step_fn(iters_list):
             self.model.eval()
-            first_iter = True
+            # first_iter = True
+            losses = []
             for i, it in enumerate(iters_list):
                 x, y = next(it)
                 x = x.to(self.device)
                 y = y.to(self.device)
                 yhat = self.model(x, i)
-                if first_iter:
-                    loss = self.loss_fn(yhat, y)  # First loss initializes 'loss'
-                    first_iter = False
-                else:
-                    loss = loss + self.loss_fn(yhat, y)
+                losses.append(self.loss_fn(yhat, y))
+            loss = torch.stack(losses)
+            loss = (loss * self.alph).mean()
             return loss.item()
 
         return perform_val_step_fn
@@ -198,14 +195,14 @@ class Manager(object):
                 val_loss = self._run_all_mini_batch(validation=True)
                 self.val_losses.append(val_loss)
 
-
     def save_checkpoint(self, filename):
         # Builds dictionary with all elements for resuming training
         checkpoint = {'epoch': self.total_epochs,
                       'model_state_dict': self.model.state_dict(),
                       'optimizer_state_dict': self.optimizer.state_dict(),
                       'loss': self.losses,
-                      'val_loss': self.val_losses}
+                      'val_loss': self.val_losses,
+                      'alpha': self.alph}
 
         torch.save(checkpoint, filename)
 
@@ -225,9 +222,9 @@ class Manager(object):
         self.total_epochs = checkpoint['epoch']
         self.losses = checkpoint['loss']
         self.val_losses = checkpoint['val_loss']
+        self.alph = checkpoint['alpha'].to(self.device)
 
         self.model.train()  # always use TRAIN for resuming training
-
 
     def plot_losses(self):
         fig = plt.figure(figsize=(10, 4))
@@ -239,7 +236,6 @@ class Manager(object):
         plt.legend()
         plt.tight_layout()
         return fig
-
 
     def set_optimizer(self, optimizer):
         self.optimizer = optimizer
@@ -278,44 +274,14 @@ class Manager(object):
         return
 
     @staticmethod
-    def _visualize_intensity(axs, x, y=None, yhat=None, layer_name='', title=None):
-        # The number of images is the number of subplots in a row
-        n_images = len(axs)
-        # Gets max and min values for scaling the grayscale
-        minv, maxv = np.min(x[:n_images]), np.max(x[:n_images]) / 3
-        # For each image
-        for j, image in enumerate(x[:n_images]):
-            ax = axs[j]
-            # Sets title, labels, and removes ticks
-            if title is not None:
-                ax.set_title('{} #{}'.format(title, j), fontsize=12)
-            '''ax.set_ylabel(
-                '{}\n{}x{}'.format(layer_name, *np.atleast_2d(image).shape),
-                rotation=0, labelpad=40
-            )'''
-            xlabel1 = '' if y is None else '\nLabel: {}'.format(y[j])
-            xlabel2 = '' if yhat is None else '\nPredicted: {}'.format(yhat[j])
-            xlabel = '{}{}'.format(xlabel1, xlabel2)
-            if len(xlabel):
-                ax.set_xlabel(xlabel, fontsize=12)
-            ax.set_xticks([])
-            ax.set_yticks([])
-
-            # Plots weight as an image
-            ax.imshow(
-                np.atleast_2d(image.squeeze()),
-                cmap='gray',
-                vmin=minv,
-                vmax=maxv
-            )
-        return
-
-    @staticmethod
     def _visualize_phases(fig, axs, x, y=None, yhat=None, layer_name='', title=None):
         # The number of images is the number of subplots in a row
         n_images = len(axs)
         # Gets max and min values for scaling the grayscale
-        minv, maxv = 0, np.pi
+        minv, maxv = np.min(x[:n_images]), np.max(x[:n_images])
+        lambd_mean = 0.8e-3
+        hmin = 0.25 * lambd_mean
+        hmax = 1.5 * lambd_mean
         # For each image
         for j, image in enumerate(x[:n_images]):
             ax = axs[j]
@@ -326,39 +292,18 @@ class Manager(object):
             # Plots weight as an image
             im = ax.imshow(
                 np.atleast_2d(image.squeeze()),
-                cmap='jet',
+                cmap='viridis',
                 vmin=minv,
                 vmax=maxv
             )
         cbar_ax = fig.add_axes([0.92, 0.12, 0.01, 0.75])  # Adjust these values as needed
         cbar = fig.colorbar(im, cax=cbar_ax)
         # Set custom tick positions
-        cbar.set_ticks([0, np.pi])
+        cbar.set_ticks([hmin, hmax])
         # Set custom tick labels
-        cbar.set_ticklabels(['0', '$\\pi$'])
+        cbar.set_ticklabels(['0.25 $\\lambda$', '1.50 $\\lambda$'])
 
         return
-
-    def attach_intensity_hooks(self, layer_name, hook_fn=None):
-        # Clear any previous values
-        self.visualization = {}
-        # Creates the dictionary to map layer objects to their names
-        modules = list(self.model.named_modules())
-        layer_names = {layer: name for name, layer in modules[1:]}
-
-        if hook_fn is None:
-            # Hook function to be attached to the forward pass
-            def hook_fn(layer, inputs, outputs):
-                name = layer_names[layer]
-                self.visualization[name] = outputs.detach().cpu().numpy()
-
-        for name, layer in modules:
-            # If the layer is in our list
-            if name == layer_name:
-                # Initializes the corresponding key in the dictionary
-                self.visualization[name] = None
-                # Register the forward hook and keep the handle in another dict
-                self.handles[name] = layer.register_forward_hook(hook_fn)
 
     def attach_hooks(self, layers_to_hook, hook_fn=None):
         # Clear any previous values
@@ -397,17 +342,15 @@ class Manager(object):
         # Clear the dict, as all hooks have been removed
         self.handles = {}
 
-
     def visualize_height_mask(self, layers_name, hmin, hmax, bit_depth):
         n_weights = []
-        linspace = torch.linspace(hmin, hmax, 2 ** bit_depth)
+        linspace = np.linspace(hmin, hmax, 2 ** bit_depth)
         for name in layers_name:
             layer = getattr(self.model, name)
-            weights = layer.height.data
-            weights = (torch.sin(weights) + 1) / 2 * (2 ** bit_depth - 1)
-            weights = torch.round(weights).int()
+            weights = layer.height.data.detach().cpu().numpy()
+            weights = (np.sin(weights) + 1) / 2 * (2 ** bit_depth - 1)
+            weights = np.round(weights).astype(int)
             weights = linspace[weights]
-            weights = weights.cpu().numpy()
             n_weights.append(weights)
 
         n_channels = len(layers_name)
@@ -419,40 +362,101 @@ class Manager(object):
         )
         return fig
 
+    def get_transform_tensor(self, A):
+        input_fov = self.model.input_fov
+        x = torch.eye(input_fov ** 2)
+        x = x.view((input_fov ** 2, input_fov, input_fov))
+        A_hat = []
+        with torch.no_grad():
+            self.model.eval()
+            x = x.to(self.device)
+            for i in range(self.n_multiplexing):
+                yhat = self.model(x, i)
+                yhat = yhat.view(yhat.size(0), -1)
+                yhat = torch.t(yhat)
+                A_hat.append(yhat)
+            A_hat = torch.stack(A_hat).detach().cpu()
+        denomi = torch.norm(A_hat, dim=(1, 2)) ** 2
+        nomi = (A * torch.conj(A_hat)).sum(dim=(1, 2))
+        factor = (nomi / denomi).unsqueeze(-1).unsqueeze(-1)
+        A_hat = factor * A_hat
+        return A_hat
 
-    def visualize_outputs(self, layers, size, n_padd, n_images=8, y=None, yhat=None):
-        layers = filter(lambda l: l in self.visualization.keys(), layers)
-        layers = list(layers)
-        shapes = [self.visualization[layer].shape for layer in layers]
-        n_rows = [shape[1] if len(shape) == 4 else 1 for shape in shapes]
-        total_rows = np.sum(n_rows)
+    def _helper_plot(self, fig, dic):
+        for i in range(len(dic['axes'])):
+            ax = dic['axes'][i]
+            cax = ax.imshow(dic['x'][i], cmap=dic['colormap'], vmin=dic['min'], vmax=dic['max'])
+            ax.set_title(dic['title'].format(i + 1))
+            ax.set_xticks([])
+            ax.set_yticks([])
+            fig.colorbar(cax, ax=ax, fraction=0.046, pad=0.04)
+        return
 
-        fig, axes = plt.subplots(total_rows, n_images,
-                                 figsize=(2 * n_images, 2 * total_rows))
-        axes = np.atleast_2d(axes).reshape(total_rows, n_images)
+    def figure_1(self, A):
+        Ah = self.get_transform_tensor(A)
+        A_abs = torch.abs(A)
+        A_ang = torch.angle(A)
+        Ah_abs = torch.abs(Ah)
+        Ah_ang = torch.angle(Ah)
+        dA = torch.abs(A - Ah)
+        mean_error = dA.mean()
+        fig, axes = plt.subplots(4, 5, figsize=(3 * 5, 3 * 4))
+        axes = axes.reshape(4, 5)
+        dics = [
+            {'x': A_abs, 'axes': axes[:, 0], 'title': '$|A_{}|$', 'colormap': 'gray', 'min': 0, 'max': 1},
+            {'x': A_ang, 'axes': axes[:, 1], 'title': '$\\angle A_{}$', 'colormap': 'twilight', 'min': -np.pi,
+             'max': np.pi},
+            {'x': Ah_abs, 'axes': axes[:, 2], 'title': '$|\\hat A_{}|$', 'colormap': 'gray', 'min': 0, 'max': 1},
+            {'x': Ah_ang, 'axes': axes[:, 3], 'title': '$\\angle \\hat A_{}$', 'colormap': 'twilight', 'min': -np.pi,
+             'max': np.pi},
+            {'x': dA, 'axes': axes[:, 4], 'title': '$|A - \\hat A_{}|$', 'colormap': 'afmhot', 'min': 0,
+             'max': torch.max(dA)}
+        ]
+        for dic in dics:
+            self._helper_plot(fig, dic)
+        plt.show()
+        return fig, mean_error
 
-        # Loops through the layers, one layer per row of subplots
-        row = 0
-        for i, layer in enumerate(layers):
-            # Takes the produced feature maps for that layer
-            output = self.visualization[layer]
-            if output.shape[1] > size:
-                output = np.abs(output[:n_images, n_padd:size + n_padd, n_padd:size + n_padd])
-            is_vector = len(output.shape) == 2
-
-            for j in range(n_rows[i]):
-                Manager._visualize_tensors(
-                    axes[row, :],
-                    output,
-                    y,
-                    yhat,
-                    layer_name=layers[i],
-                    title='Image' if (row == 0) else None
-                )
-                row += 1
-
-        for ax in axes.flat:
-            ax.label_outer()
-
-        plt.tight_layout()
+    def figure_2(self):
+        a = iter(self.val_loaders_list[0])
+        x, y = next(a)
+        with torch.no_grad():
+            self.model.eval()
+            yhat = x.to(self.device)
+            yhat = self.model(yhat, 0)
+            yhat = yhat.detach().cpu()
+        denomi = torch.norm(yhat, dim=(1, 2)) ** 2
+        nomi = (y * torch.conj(yhat)).sum(dim=(1, 2))
+        factor = (nomi / denomi).unsqueeze(-1).unsqueeze(-1)
+        yh = factor * yhat
+        x_abs = torch.abs(x)
+        x_ang = torch.angle(x)
+        y_abs = torch.abs(y)
+        y_ang = torch.angle(y)
+        yh_abs = torch.abs(yh)
+        yh_ang = torch.angle(yh)
+        dy_abs = torch.abs(y - yh)
+        dy_ang = torch.abs(torch.angle(y) - torch.angle(yh))
+        # mean_error = dy_abs.mean()
+        fig, axes = plt.subplots(4, 8, figsize=(3.5 * 8, 3 * 4))
+        axes = axes.reshape(4, 8)
+        dics = [
+            {'x': x_abs, 'axes': axes[:, 0], 'title': '$|x_{}|$', 'colormap': 'gray', 'min': 0,
+             'max': torch.max(x_abs)},
+            {'x': x_ang, 'axes': axes[:, 1], 'title': '$\\angle x_{}$', 'colormap': 'twilight', 'min': -np.pi,
+             'max': np.pi},
+            {'x': y_abs, 'axes': axes[:, 2], 'title': '$|y_{}|$', 'colormap': 'gray', 'min': 0, 'max': torch.max(y_abs)},
+            {'x': y_ang, 'axes': axes[:, 3], 'title': '$\\angle y_{}$', 'colormap': 'twilight', 'min': -np.pi,
+             'max': np.pi},
+            {'x': yh_abs, 'axes': axes[:, 4], 'title': '$|\\hat y_{}|$', 'colormap': 'gray', 'min': 0, 'max': torch.max(yh_abs)},
+            {'x': yh_ang, 'axes': axes[:, 5], 'title': '$\\angle \\hat y_{}$', 'colormap': 'twilight', 'min': -np.pi,
+             'max': np.pi},
+            {'x': dy_abs, 'axes': axes[:, 6], 'title': '$|y - \\hat y_{}|$', 'colormap': 'afmhot', 'min': 0,
+             'max': torch.max(dy_abs)},
+            {'x': dy_ang, 'axes': axes[:, 7], 'title': '$|\\angle y - \\angle \\hat y_{}|$', 'colormap': 'afmhot', 'min': 0,
+             'max': np.pi}
+        ]
+        for dic in dics:
+            self._helper_plot(fig, dic)
+        plt.show()
         return fig

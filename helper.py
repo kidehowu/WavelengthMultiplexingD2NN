@@ -1,6 +1,7 @@
 import torch
 import torch.optim as optim
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 
 import torchvision
@@ -60,7 +61,11 @@ def plot_cosine_similarity_matrix(data):
 
 def mse_loss():
     def mse(output, target):
-        x = output - target
+        target = F.normalize(target, dim=(1, 2))
+        denomi = torch.norm(output, dim=(1, 2)) ** 2
+        nomi = (target * torch.conj(output)).sum(dim=(1, 2))
+        factor = (nomi / denomi).unsqueeze(-1).unsqueeze(-1)
+        x = target - factor * output
         x = (x * torch.conj(x)).real.mean()
         return x
 
